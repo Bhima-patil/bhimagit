@@ -1,0 +1,53 @@
+version: 0.2
+
+phases:
+  install:
+    commands:
+      - echo "Skipping yum update..."
+
+  pre_build:
+    commands:
+      - echo "version controller"
+      - yum update -y
+      - yum install jq -y
+      - yum install zip -y
+      
+  build:
+    commands:
+      - mvn clean install 
+      - aws s3 cp s3://ohana-api-pipeline-bucket/appspec.yml .
+      - aws s3 cp s3://ohana-api-pipeline-bucket/application_start.sh .
+      - aws s3 cp s3://ohana-api-pipeline-bucket/application_stop.sh .
+      - cp target/ohana-api-0.0.1-SNAPSHOT.war .
+      - mv ohana-api-0.0.1-SNAPSHOT.war ohana-api.war
+      
+  post_build:
+    commands:
+      - echo "Build Initiated"
+      - param_name=/ohana-api/$STAGE/deploy/role
+      - echo  the SSM param ${param_name}
+      - DEPLOY_ROLE=$(aws ssm get-parameter --name $param_name --with-decryption | jq ".Parameter.Value" | tr -d \")
+      - echo $DEPLOY_ROLE
+      - role=$(aws sts assume-role --role-arn $DEPLOY_ROLE --role-session-name ohana-api-deployer-session --duration-seconds 900)
+      - echo $role
+      - KEY=$(echo $role | jq ".Credentials.AccessKeyId" --raw-output)
+      - echo $KEY
+      - SECRET=$(echo $role | jq ".Credentials.SecretAccessKey" --raw-output)
+      - TOKEN=$(echo $role | jq ".Credentials.SessionToken" --raw-output)
+      - export AWS_ACCESS_KEY_ID=$KEY
+      - export AWS_SESSION_TOKEN=$TOKEN
+      - export AWS_SECRET_ACCESS_KEY=$SECRET
+      - export AWS_DEFAULT_REGION=us-west-2
+      - DEPLOYMENT_PACKAGE_NAME="deployment-package-$(date +"%Y%m%d%H%M%S").zip"
+      - zip -r $DEPLOYMENT_PACKAGE_NAME appspec.yml application_stop.sh application_start.sh ohana-api.war
+      - aws s3 cp $DEPLOYMENT_PACKAGE_NAME s3://ohana-api-bucket-lab/$DEPLOYMENT_PACKAGE_NAME
+      - aws sts get-caller-identity
+      - aws deploy create-deployment --application-name ohana-api-application --deployment-config-name CodeDeployDefault.OneAtATime --deployment-group-name ohana-api-deploygroup --description "Deployment Description" --s3-location bucket=ohana-api-bucket-lab,bundleType=zip,key=$DEPLOYMENT_PACKAGE_NAME --region us-west-2
+      - deploymentId=$(aws deploy list-deployments --application-name ohana-api-application --deployment-group-name ohana-api-deploygroup --region us-west-2 --query 'deployments[0]' --output text)
+      - echo "Waiting for deployment to complete..."
+      - aws deploy wait deployment-successful --deployment-id $deploymentId --region us-west-2
+      - echo "finished pipeline"
+    
+artifacts:
+  files: "**/*.war"
+  discard-paths: yes

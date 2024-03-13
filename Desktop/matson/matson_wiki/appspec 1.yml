@@ -1,0 +1,17 @@
+### appspec.yml ###
+version: 0.0
+os: linux
+files:
+  - source: /ohana-api.war
+    destination: /opt/apache-tomcat-10.1.18/webapps/ohana-api.war
+
+file_exists_behavior: OVERWRITE
+hooks:
+  ApplicationStop:
+    - location: application_stop.sh
+      timeout: 300
+      runas: root
+  ApplicationStart:
+    - location: application_start.sh
+      timeout: 300
+      runas: root

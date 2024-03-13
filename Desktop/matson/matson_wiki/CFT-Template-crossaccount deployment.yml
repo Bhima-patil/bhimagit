@@ -1,0 +1,268 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Deploy pipeline for ec2 cicd
+
+Parameters:
+  GitHubRepo:
+    Type: String
+    Description: The GitHub repo
+    Default: "ohana-api"
+
+  GitHubBranch:
+    Type: String
+    Description: The GitHub branch name to deploy
+    Default: "ohana-cicd-aftab"
+
+  GitHubUser:
+    Type: String
+    Description: The GitHub Org Name
+    Default: "MatsonInc"
+
+  GitHubToken:
+    Type: String
+    Description: GitHub personal access token
+    NoEcho: true  # This ensures the token is not displayed in plaintext during stack creation
+
+  CodeBuildEnvironmentType:
+    Type: String
+    Default: "LINUX_CONTAINER"
+    Description: The build container type
+
+  CodeBuildComputeType:
+    Type: String
+    Default: "BUILD_GENERAL1_SMALL"
+    Description: The build compute type
+
+  CodeBuildImage:
+    Type: String
+    Default: "aws/codebuild/amazonlinux2-x86_64-standard:corretto11"
+    Description: The build image
+
+  ohanaapiLabAccountId:
+    Type: String
+    Description: Account ID for matsonlabs
+    Default: 275416279984
+
+  ohanaapiLabSiteBucketName:
+    Type: String
+    Description: The Site Hosting Bucket Name - Lab
+    Default: ohana-api-bucket-lab
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "GitHub Config"
+        Parameters:
+          - GitHubUser
+          - GitHubRepo
+          - GitHubBranch
+          - GitHubToken
+      - Label:
+          default: "CodeBuild Config"
+        Parameters:
+          - CodeBuildEnvironmentType
+          - CodeBuildComputeType
+          - CodeBuildImage
+      - Label:
+          default: "Account Config"
+        Parameters:
+          - ohanaapiLabAccountId
+      - Label:
+          default: "Site Hosting"
+        Parameters:
+          - ohanaapiLabSiteBucketName
+    ParameterLabels:
+      GitHubUser:
+        default: GitHub User Name
+      GitHubRepo:
+        default: GitHub Repo Name
+      GitHubBranch:
+        default: GitHub Repo Branch Name
+      GitHubToken:
+        default: GitHub Personal Access Token
+      CodeBuildEnvironmentType:
+        default: CodeBuild Type
+      CodeBuildComputeType:
+        default: CodeBuild Instance Type
+      CodeBuildImage:
+        default: CodeBuild image
+      ohanaapiLabAccountId:
+        default: Account ID for ohana api AWS Lab Env
+      ohanaapiLabSiteBucketName:
+        default: ohanaapiLab Site Hosting Bucket
+
+Resources:
+  GitHubCodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      RoleName: !Sub ${AWS::StackName}-codebuild-role
+      Policies:
+        - PolicyName: !Sub ${AWS::StackName}-codebuild-policy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/ohana-api-build-lab*"
+                 
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource:
+                  # - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/crossaccount-role/*
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/ohana-api/*
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketAcl
+                  - s3:GetBucketLocation
+                Resource:
+                  - arn:aws:s3:::ohana-api-*/*
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole 
+                Resource: # cross-account deploy roles
+                  - !Sub arn:aws:iam::${ohanaapiLabAccountId}:role/ohana-api-deployer-role
+            Version: "2012-10-17"
+
+  ohanaapiCodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      RoleName: !Sub ${AWS::StackName}-codepipeline-role
+      Policies:
+        - PolicyName: !Sub ${AWS::StackName}-codepipeline-policy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource:
+                  - !GetAtt ohanaapiCodeBuildDeployLab.Arn  # Corrected reference here
+              - Effect: Allow
+                Action:
+                  - s3:Put*
+                  - s3:Get*
+                Resource: 
+                  - arn:aws:s3:::ohana-api-*/*
+            Version: "2012-10-17"
+
+  #
+  # pipeline bucket
+  #
+  ohanaapiCodePipelineBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-bucket
+      LifecycleConfiguration:
+        Rules:
+          - Id: !Sub ${AWS::StackName}-lifecycle-policy
+            Status: Enabled
+            Prefix: "ohana-api-pipeline/SourceArti/"
+            Transition:
+              StorageClass: INTELLIGENT_TIERING
+              TransitionInDays: 30
+            ExpirationInDays: 300
+
+  ohanaapiCodeBuildDeployLab:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: ohana-api-build-lab
+      Description: Deploy ohanaapiCodeBuildDeploy to Lab
+      ServiceRole: !GetAtt GitHubCodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: !Ref CodeBuildEnvironmentType
+        ComputeType: !Ref CodeBuildComputeType
+        Image: !Sub ${CodeBuildImage}
+        EnvironmentVariables:
+          - Name: DURATION
+            Value: "2400"
+          - Name: STAGE
+            Value: "lab"
+          - Name: CACHE_TTL_SECONDS
+            Value: "15552000"
+          - Name: SITE_BUCKET
+            Value: !Ref ohanaapiLabSiteBucketName
+          - Name: account
+            Value: "Lab"
+      Source:
+        Type: CODEPIPELINE
+      TimeoutInMinutes: 40
+  
+  #
+  # pipeline
+  #
+  ohanaapiCodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub ${AWS::StackName}
+      RoleArn: !GetAtt ohanaapiCodePipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ohanaapiCodePipelineBucket
+      Stages:
+        - Name: ohanaapi-Source
+          Actions:
+            - Name: Source
+              InputArtifacts: []
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Version: "1"
+                Provider: GitHub
+              OutputArtifacts:
+                - Name: SourceArtifacts
+              Configuration:
+                Owner: !Ref GitHubUser
+                Repo: !Ref GitHubRepo
+                Branch: !Ref GitHubBranch
+                OAuthToken: !Ref GitHubToken
+              RunOrder: 1
+        - Name: MatsonLabs
+          Actions:
+            - Name: Deploy-to-MatsonLabs
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: "1"
+                Provider: CodeBuild
+              InputArtifacts:
+                - Name: SourceArtifacts
+              OutputArtifacts:
+                - Name: LabDeploymentArtifactsF
+              Configuration:
+                ProjectName: !Ref ohanaapiCodeBuildDeployLab
+              RunOrder: 1 
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ohanaapiCodePipelineBucket
+
+Outputs:
+  GitHubTokenSecretName:
+    Description: Secret Name for GitHub Token in AWS Secrets Manager
+    Value: !Ref GitHubToken
